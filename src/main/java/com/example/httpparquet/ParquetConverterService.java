@@ -4,6 +4,7 @@ import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.context.annotation.DependsOn;
 import org.springframework.stereotype.Service;
 
 import java.io.IOException;
@@ -17,6 +18,7 @@ import java.util.Comparator;
 import java.util.stream.Stream;
 
 @Service("parquetConverterService")
+@DependsOn("gcsUploadService")
 public class ParquetConverterService {
 
     private static final Logger log = LoggerFactory.getLogger(ParquetConverterService.class);
@@ -24,12 +26,15 @@ public class ParquetConverterService {
 
     private final ConversionQueue conversionQueue;
     private final Path outputDirectory;
+    private final GcsUploadService gcsUploadService;
 
     private volatile Thread converterThread;
 
-    public ParquetConverterService(ConversionQueue conversionQueue, Path outputDirectory) {
+    public ParquetConverterService(ConversionQueue conversionQueue, Path outputDirectory,
+                                   GcsUploadService gcsUploadService) {
         this.conversionQueue = conversionQueue;
         this.outputDirectory = outputDirectory;
+        this.gcsUploadService = gcsUploadService;
     }
 
     @PostConstruct
@@ -99,6 +104,8 @@ public class ParquetConverterService {
             log.warn("Conversion succeeded but failed to delete {}, leaving file for manual cleanup",
                     jsonlFile.getFileName(), e);
         }
+
+        gcsUploadService.enqueueForUpload(parquetFile);
     }
 
     private Path toParquetPath(Path jsonlFile) {

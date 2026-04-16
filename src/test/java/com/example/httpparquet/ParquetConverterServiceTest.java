@@ -2,7 +2,9 @@ package com.example.httpparquet;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.api.io.TempDir;
+import org.mockito.junit.jupiter.MockitoExtension;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -14,7 +16,9 @@ import java.sql.ResultSet;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 import static java.util.concurrent.TimeUnit.SECONDS;
+import static org.mockito.Mockito.mock;
 
+@ExtendWith(MockitoExtension.class)
 class ParquetConverterServiceTest {
 
     @TempDir
@@ -30,7 +34,7 @@ class ParquetConverterServiceTest {
 
     private void createAndStart() throws IOException {
         conversionQueue = new ConversionQueue();
-        service = new ParquetConverterService(conversionQueue, tempDir);
+        service = new ParquetConverterService(conversionQueue, tempDir, mock(GcsUploadService.class));
         service.start();
     }
 
