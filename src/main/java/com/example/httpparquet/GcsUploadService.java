@@ -15,15 +15,17 @@ import org.springframework.stereotype.Service;
 
 import java.io.FileInputStream;
 import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
+import java.nio.file.*;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.stream.Stream;
 
 @Service("gcsUploadService")
 public class GcsUploadService {
 
     private static final Logger log = LoggerFactory.getLogger(GcsUploadService.class);
     private static final Path POISON_PILL = Path.of("__SHUTDOWN__");
+
+    private final Path outputDirectory;
 
     @Value("${gcs.enabled:false}")
     private boolean enabled;
@@ -39,7 +41,13 @@ public class GcsUploadService {
 
     private final LinkedBlockingQueue<Path> queue = new LinkedBlockingQueue<>();
     private Storage storage;
+    private WatchService watchService;
+    private volatile Thread watcherThread;
     private volatile Thread uploaderThread;
+
+    public GcsUploadService(Path outputDirectory) {
+        this.outputDirectory = outputDirectory;
+    }
 
     @PostConstruct
     public void start() throws IOException {
@@ -56,29 +64,59 @@ public class GcsUploadService {
                                 .createScoped("https://www.googleapis.com/auth/cloud-platform"));
             }
         }
-        // if credentialsPath is blank, the client uses Application Default Credentials
-        // (GOOGLE_APPLICATION_CREDENTIALS env var, gcloud auth, or instance metadata)
+        // blank credentialsPath → Application Default Credentials
         storage = builder.build().getService();
 
-        uploaderThread = Thread.ofVirtual().name("gcs-uploader").start(this::runLoop);
+        // Register watcher before scanning so no .parquet created between the two is missed
+        watchService = FileSystems.getDefault().newWatchService();
+        outputDirectory.register(watchService, StandardWatchEventKinds.ENTRY_CREATE);
+
+        // Queue any .parquet files that exist from previous runs and were not yet uploaded
+        try (Stream<Path> stream = Files.list(outputDirectory)) {
+            stream.filter(p -> p.getFileName().toString().endsWith(".parquet"))
+                    .filter(Files::isRegularFile)
+                    .forEach(p -> {
+                        try {
+                            queue.put(p);
+                            log.info("Queued existing .parquet for upload: {}", p.getFileName());
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                        }
+                    });
+        }
+
+        watcherThread = Thread.ofVirtual().name("parquet-watcher").start(this::watchLoop);
+        uploaderThread = Thread.ofVirtual().name("gcs-uploader").start(this::uploadLoop);
         log.info("GCS uploader started — target: gs://{}/{}", bucketName,
                 objectPrefix.isBlank() ? "" : objectPrefix + "/");
     }
 
-    /**
-     * Enqueues a parquet file for upload. No-op when GCS is disabled.
-     * Called from the converter thread after each successful conversion.
-     */
-    public void enqueueForUpload(Path parquetFile) {
-        if (!enabled) return;
+    private void watchLoop() {
         try {
-            queue.put(parquetFile);
+            while (!Thread.currentThread().isInterrupted()) {
+                WatchKey key;
+                try {
+                    key = watchService.take();
+                } catch (ClosedWatchServiceException e) {
+                    break;  // stop() closed the service
+                }
+                for (WatchEvent<?> event : key.pollEvents()) {
+                    if (event.kind() == StandardWatchEventKinds.OVERFLOW) continue;
+                    Path filename = (Path) event.context();
+                    if (!filename.toString().endsWith(".parquet")) continue;
+                    Path fullPath = outputDirectory.resolve(filename);
+                    if (Files.exists(fullPath)) {
+                        queue.put(fullPath);
+                    }
+                }
+                key.reset();
+            }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
     }
 
-    private void runLoop() {
+    private void uploadLoop() {
         try {
             while (true) {
                 Path path = queue.take();
@@ -91,6 +129,10 @@ public class GcsUploadService {
     }
 
     private void upload(Path parquetFile) {
+        if (!Files.exists(parquetFile)) {
+            return;  // already uploaded and deleted by a duplicate queue entry
+        }
+
         String objectName = objectPrefix.isBlank()
                 ? parquetFile.getFileName().toString()
                 : objectPrefix + "/" + parquetFile.getFileName().toString();
@@ -112,9 +154,13 @@ public class GcsUploadService {
 
     @PreDestroy
     public void stop() throws InterruptedException {
+        if (watchService != null) {
+            try { watchService.close(); } catch (IOException e) { log.warn("Error closing watcher", e); }
+        }
+        if (watcherThread != null) watcherThread.join(5_000);
         if (uploaderThread != null) {
             queue.put(POISON_PILL);
-            uploaderThread.join(120_000);  // large parquet files can be slow to upload
+            uploaderThread.join(120_000);
         }
     }
 }

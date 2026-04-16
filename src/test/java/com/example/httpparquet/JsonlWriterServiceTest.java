@@ -26,14 +26,12 @@ class JsonlWriterServiceTest {
     Path tempDir;
 
     private IngestionQueue ingestionQueue;
-    private ConversionQueue conversionQueue;
     private AtomicReference<Instant> clockInstant;
     private JsonlWriterService service;
 
     @BeforeEach
     void setUp() {
         ingestionQueue = new IngestionQueue();
-        conversionQueue = new ConversionQueue();
         clockInstant = new AtomicReference<>(Instant.parse("2026-04-16T14:00:00Z"));
     }
 
@@ -43,7 +41,7 @@ class JsonlWriterServiceTest {
             @Override public Clock withZone(ZoneId zone) { return this; }
             @Override public Instant instant() { return clockInstant.get(); }
         };
-        return new JsonlWriterService(ingestionQueue, conversionQueue, tempDir, mutableClock, maxIntervalMs, maxBytes);
+        return new JsonlWriterService(ingestionQueue, tempDir, mutableClock, maxIntervalMs, maxBytes);
     }
 
     @AfterEach
@@ -93,7 +91,6 @@ class JsonlWriterServiceTest {
         });
 
         Path tmp = findFirst(".jsonl.tmp").orElseThrow();
-        // Expected format: yyyy-MM-dd'T'HH-mm-ss-SSS.jsonl.tmp
         assertThat(tmp.getFileName().toString())
                 .matches("\\d{4}-\\d{2}-\\d{2}T\\d{2}-\\d{2}-\\d{2}-\\d{3}\\.jsonl\\.tmp");
     }
@@ -116,7 +113,7 @@ class JsonlWriterServiceTest {
         // Advance to next hour — triggers rollover on next poll
         clockInstant.set(Instant.parse("2026-04-16T15:00:00Z"));
 
-        // Completed .jsonl should appear
+        // Completed .jsonl should appear — the converter (separate service) picks it up from here
         await().atMost(5, SECONDS).until(() -> {
             try { return findFirst(".jsonl").isPresent(); }
             catch (IOException e) { return false; }
@@ -128,51 +125,19 @@ class JsonlWriterServiceTest {
             catch (IOException e) { return false; }
         });
 
-        // The completed .jsonl should have been enqueued for conversion and have the right name format
-        Path queued = conversionQueue.take();
-        assertThat(queued.getParent()).isEqualTo(tempDir);
-        assertThat(queued.getFileName().toString())
+        Path jsonl = findFirst(".jsonl").orElseThrow();
+        assertThat(jsonl.getFileName().toString())
                 .matches("\\d{4}-\\d{2}-\\d{2}T\\d{2}-\\d{2}-\\d{2}-\\d{3}\\.jsonl");
     }
 
     @Test
-    void jsonlAndParquetShareTheSameTimestampStem() throws Exception {
-        // Verify the naming contract: stripping the extension from the .jsonl gives the same
-        // stem that the converter uses for the .parquet, so the pair is always co-named.
-        service = createService(100, 65536);
-        service.start();
-
-        ingestionQueue.put(List.of("{\"a\":1}"));
-        await().atMost(5, SECONDS).until(() -> {
-            try {
-                Optional<Path> tmp = findFirst(".jsonl.tmp");
-                return tmp.isPresent() && Files.size(tmp.get()) > 0;
-            } catch (IOException e) { return false; }
-        });
-
-        clockInstant.set(Instant.parse("2026-04-16T15:00:00Z"));
-        await().atMost(5, SECONDS).until(() -> {
-            try { return findFirst(".jsonl").isPresent(); }
-            catch (IOException e) { return false; }
-        });
-
-        Path jsonl = findFirst(".jsonl").orElseThrow();
-        String stem = jsonl.getFileName().toString().replace(".jsonl", "");
-        Path expectedParquet = tempDir.resolve(stem + ".parquet");
-
-        // Both names carry the same ms-precision timestamp prefix
-        assertThat(stem).matches("\\d{4}-\\d{2}-\\d{2}T\\d{2}-\\d{2}-\\d{2}-\\d{3}");
-        assertThat(expectedParquet.getFileName().toString()).isEqualTo(stem + ".parquet");
-    }
-
-    @Test
-    void shutdownRenamesTmpToJsonlWithoutEnqueuing() throws Exception {
+    void shutdownRenamesTmpToJsonl() throws Exception {
         service = createService(100, 65536);
         service.start();
 
         ingestionQueue.put(List.of("{\"event\":\"shutdown-test\"}"));
 
-        // Wait for data to be written to the .tmp file
+        // Wait for data to land in the .tmp file
         await().atMost(5, SECONDS).until(() -> {
             try {
                 Optional<Path> tmp = findFirst(".jsonl.tmp");
@@ -181,22 +146,45 @@ class JsonlWriterServiceTest {
         });
 
         service.stop();
-        service = null;  // prevent tearDown double-stop
+        service = null;
 
-        // .tmp is gone, .jsonl exists with the data
+        // .tmp replaced by .jsonl — converter picks it up on next startup
         assertThat(findFirst(".jsonl.tmp")).isEmpty();
         Path jsonl = findFirst(".jsonl").orElseThrow();
         assertThat(Files.size(jsonl)).isGreaterThan(0);
         assertThat(Files.readString(jsonl)).contains("shutdown-test");
+    }
 
-        // Nothing enqueued — the converter picks it up on next startup
-        assertThat(conversionQueue.size()).isEqualTo(0);
+    @Test
+    void emptyFileIsDeletedNotRenamedOnRoll() throws Exception {
+        service = createService(60_000, 65536);
+        service.start();
+
+        // Wait for the initial .tmp to be opened
+        await().atMost(5, SECONDS).until(() -> {
+            try { return findFirst(".jsonl.tmp").isPresent(); }
+            catch (IOException e) { return false; }
+        });
+
+        // Roll to next hour with no records written
+        clockInstant.set(Instant.parse("2026-04-16T15:00:00Z"));
+
+        // Wait for the new hour's .tmp to appear
+        await().atMost(5, SECONDS).until(() -> {
+            try {
+                return findFirst(".jsonl.tmp")
+                        .map(p -> p.getFileName().toString().startsWith("2026-04-16T15"))
+                        .orElse(false);
+            } catch (IOException e) { return false; }
+        });
+
+        // Empty file must have been deleted, not promoted to .jsonl
+        assertThat(findFirst(".jsonl")).isEmpty();
     }
 
     @Test
     void flushesAfterMaxInterval() throws Exception {
-        // The flush interval check uses System.currentTimeMillis(), not the injected clock,
-        // so this test relies on real wall-clock time. 200ms fires well within the 5s window.
+        // Uses real wall-clock time (flush interval is not controlled by the injected clock)
         service = createService(200, 65536);
         service.start();
 
@@ -212,7 +200,6 @@ class JsonlWriterServiceTest {
 
     @Test
     void flushesAfterMaxBytes() throws Exception {
-        // maxBytes=1 ensures a single record exceeds the threshold
         service = createService(60_000, 1);
         service.start();
 
@@ -224,32 +211,5 @@ class JsonlWriterServiceTest {
                 return tmp.isPresent() && Files.readString(tmp.get()).contains("\"x\":1");
             } catch (IOException e) { return false; }
         });
-    }
-
-    @Test
-    void doesNotEnqueueEmptyFile() throws Exception {
-        service = createService(60_000, 65536);
-        service.start();
-
-        // Wait for the writer to open its initial .tmp
-        await().atMost(5, SECONDS).until(() -> {
-            try { return findFirst(".jsonl.tmp").isPresent(); }
-            catch (IOException e) { return false; }
-        });
-
-        // Roll to next hour with no records written
-        clockInstant.set(Instant.parse("2026-04-16T15:00:00Z"));
-
-        // Wait for the new hour's .tmp to appear (its name starts with T15)
-        await().atMost(5, SECONDS).until(() -> {
-            try {
-                return findFirst(".jsonl.tmp")
-                        .map(p -> p.getFileName().toString().startsWith("2026-04-16T15"))
-                        .orElse(false);
-            } catch (IOException e) { return false; }
-        });
-
-        // The empty file must not have been enqueued
-        assertThat(conversionQueue.size()).isEqualTo(0);
     }
 }

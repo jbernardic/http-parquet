@@ -5,7 +5,6 @@ import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.context.annotation.DependsOn;
 import org.springframework.stereotype.Service;
 
 import java.io.BufferedWriter;
@@ -24,7 +23,6 @@ import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 @Service
-@DependsOn("parquetConverterService")
 public class JsonlWriterService {
 
     private static final Logger log = LoggerFactory.getLogger(JsonlWriterService.class);
@@ -32,7 +30,6 @@ public class JsonlWriterService {
             DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH-mm-ss-SSS").withZone(ZoneOffset.UTC);
 
     private final IngestionQueue ingestionQueue;
-    private final ConversionQueue conversionQueue;
     private final Path outputDirectory;
     private final Clock clock;
     private final long maxIntervalMs;
@@ -42,13 +39,11 @@ public class JsonlWriterService {
 
     public JsonlWriterService(
             IngestionQueue ingestionQueue,
-            ConversionQueue conversionQueue,
             Path outputDirectory,
             Clock clock,
             @Value("${ingestion.flush.max-interval-ms}") long maxIntervalMs,
             @Value("${ingestion.flush.max-bytes}") long maxBytes) {
         this.ingestionQueue = ingestionQueue;
-        this.conversionQueue = conversionQueue;
         this.outputDirectory = outputDirectory;
         this.clock = clock;
         this.maxIntervalMs = maxIntervalMs;
@@ -76,9 +71,9 @@ public class JsonlWriterService {
                 if (!hour.equals(currentHour)) {
                     BufferedWriter prev = currentWriter;
                     Path prevTmpPath = currentTmpPath;
-                    currentWriter = null;  // clear before closeAndFinalize so finally block skips stale ref on IOException
+                    currentWriter = null;
                     currentTmpPath = null;
-                    closeAndFinalize(prev, prevTmpPath, true);  // normal hourly roll — enqueue for conversion
+                    closeAndFinalize(prev, prevTmpPath);
                     currentTmpPath = tmpPathFor(now);
                     currentWriter = openWriter(currentTmpPath);
                     currentHour = hour;
@@ -106,7 +101,7 @@ public class JsonlWriterService {
         } catch (IOException e) {
             log.error("JSONL writer error, data may be lost", e);
         } finally {
-            closeAndFinalize(currentWriter, currentTmpPath, false);  // shutdown — rename only, no conversion
+            closeAndFinalize(currentWriter, currentTmpPath);
         }
     }
 
@@ -114,13 +109,7 @@ public class JsonlWriterService {
         return Files.newBufferedWriter(path, StandardCharsets.UTF_8, StandardOpenOption.CREATE, StandardOpenOption.APPEND);
     }
 
-    /**
-     * Flushes, closes, and renames the current .tmp file to .jsonl.
-     * If {@code enqueue} is true (normal hourly roll), the .jsonl is put on the conversion
-     * queue immediately. If false (shutdown), it is left on disk for the converter to pick
-     * up on next startup via {@code recoverOrphanedFiles}.
-     */
-    private void closeAndFinalize(BufferedWriter writer, Path tmpPath, boolean enqueue) {
+    private void closeAndFinalize(BufferedWriter writer, Path tmpPath) {
         if (writer == null) return;
         try {
             writer.flush();
@@ -130,10 +119,18 @@ public class JsonlWriterService {
         }
         if (tmpPath == null) return;
 
+        try {
+            if (Files.size(tmpPath) == 0) {
+                Files.deleteIfExists(tmpPath);
+                return;
+            }
+        } catch (IOException e) {
+            log.warn("Could not check size of {}", tmpPath, e);
+        }
+
         Path jsonlPath = toJsonlPath(tmpPath);
         if (Files.exists(jsonlPath)) {
-            // Collision: ms-precision timestamps make this extremely unlikely, but handle it
-            // safely by streaming the .tmp content onto the end of the existing .jsonl.
+            // Collision: ms-precision timestamp makes this extremely unlikely. Merge to be safe.
             try (var in = Files.newInputStream(tmpPath);
                  var out = Files.newOutputStream(jsonlPath, StandardOpenOption.APPEND)) {
                 in.transferTo(out);
@@ -152,33 +149,7 @@ public class JsonlWriterService {
             } catch (IOException e) {
                 log.warn("Failed to rename {} to {}: segment is stranded as .tmp and cannot be auto-recovered",
                         tmpPath, jsonlPath, e);
-                return;
             }
-        }
-
-        if (!enqueue) {
-            log.info("Shutdown: {} will be converted on next startup", jsonlPath.getFileName());
-            return;
-        }
-
-        try {
-            if (Files.size(jsonlPath) > 0) {
-                // Temporarily clear the interrupt flag: lockInterruptibly() inside put() would
-                // fire immediately on an interrupted thread even on an unbounded queue.
-                boolean wasInterrupted = Thread.interrupted();
-                try {
-                    conversionQueue.put(jsonlPath);
-                } catch (InterruptedException e) {
-                    wasInterrupted = true;
-                    log.warn("Interrupted while queuing {}; file will be recovered on next startup", jsonlPath);
-                } finally {
-                    if (wasInterrupted) Thread.currentThread().interrupt();
-                }
-            } else {
-                Files.deleteIfExists(jsonlPath);
-            }
-        } catch (IOException e) {
-            log.warn("Could not check size of {}", jsonlPath, e);
         }
     }
 
