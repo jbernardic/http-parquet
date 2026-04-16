@@ -154,6 +154,8 @@ def main():
     parser = argparse.ArgumentParser(description="http-parquet load generator")
     parser.add_argument("--url", default="http://localhost:8080/ingest",
                         help="Ingest endpoint (default: http://localhost:8080/ingest)")
+    parser.add_argument("--tenant-id", default="default",
+                        help="Tenant id used for storage")
     parser.add_argument("--rate", type=float, default=50.0,
                         help="Target events per second (default: 50)")
     parser.add_argument("--batch-size", type=int, default=20,
@@ -170,7 +172,7 @@ def main():
     signal.signal(signal.SIGTERM, _shutdown)
 
     run(
-        url=args.url,
+        url=f"{args.url}/{args.tenant_id}",
         rate=args.rate,
         batch_size=args.batch_size,
         single_ratio=args.single_ratio,

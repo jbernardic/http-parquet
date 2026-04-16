@@ -52,13 +52,13 @@ class JsonlWriterServiceTest {
     // -- Helpers -------------------------------------------------------------
 
     private Optional<Path> findFirst(String suffix) throws IOException {
-        try (var stream = Files.list(tempDir)) {
+        try (var stream = Files.walk(tempDir)) {
             return stream.filter(p -> p.getFileName().toString().endsWith(suffix)).findFirst();
         }
     }
 
     private long countFiles(String suffix) throws IOException {
-        try (var stream = Files.list(tempDir)) {
+        try (var stream = Files.walk(tempDir)) {
             return stream.filter(p -> p.getFileName().toString().endsWith(suffix)).count();
         }
     }
@@ -70,7 +70,7 @@ class JsonlWriterServiceTest {
         service = createService(100, 65536);
         service.start();
 
-        ingestionQueue.put(List.of("{\"event\":\"test\"}"));
+        ingestionQueue.put(new TenantBatch("tenant1", List.of("{\"event\":\"test\"}")));
 
         await().atMost(5, SECONDS).until(() -> {
             try {
@@ -84,6 +84,8 @@ class JsonlWriterServiceTest {
     void tmpFileNameHasFullTimestampWithMilliseconds() throws Exception {
         service = createService(100, 65536);
         service.start();
+
+        ingestionQueue.put(new TenantBatch("tenant1", List.of("{\"a\":1}")));
 
         await().atMost(5, SECONDS).until(() -> {
             try { return findFirst(".jsonl.tmp").isPresent(); }
@@ -100,7 +102,7 @@ class JsonlWriterServiceTest {
         service = createService(100, 65536);
         service.start();
 
-        ingestionQueue.put(List.of("{\"hour\":\"14\"}"));
+        ingestionQueue.put(new TenantBatch("tenant1", List.of("{\"hour\":\"14\"}")));
 
         // Wait for data to be flushed to the .tmp file
         await().atMost(5, SECONDS).until(() -> {
@@ -110,8 +112,9 @@ class JsonlWriterServiceTest {
             } catch (IOException e) { return false; }
         });
 
-        // Advance to next hour — triggers rollover on next poll
+        // Advance to next hour and send a record to trigger the rollover
         clockInstant.set(Instant.parse("2026-04-16T15:00:00Z"));
+        ingestionQueue.put(new TenantBatch("tenant1", List.of("{\"hour\":\"15\"}")));
 
         // Completed .jsonl should appear — the converter (separate service) picks it up from here
         await().atMost(5, SECONDS).until(() -> {
@@ -135,7 +138,7 @@ class JsonlWriterServiceTest {
         service = createService(100, 65536);
         service.start();
 
-        ingestionQueue.put(List.of("{\"event\":\"shutdown-test\"}"));
+        ingestionQueue.put(new TenantBatch("tenant1", List.of("{\"event\":\"shutdown-test\"}")));
 
         // Wait for data to land in the .tmp file
         await().atMost(5, SECONDS).until(() -> {
@@ -160,14 +163,18 @@ class JsonlWriterServiceTest {
         service = createService(60_000, 65536);
         service.start();
 
-        // Wait for the initial .tmp to be opened
+        // An empty batch opens a 0-byte .tmp file without writing any records
+        ingestionQueue.put(new TenantBatch("tenant1", List.of()));
+
+        // Wait for the empty .tmp to be created
         await().atMost(5, SECONDS).until(() -> {
             try { return findFirst(".jsonl.tmp").isPresent(); }
             catch (IOException e) { return false; }
         });
 
-        // Roll to next hour with no records written
+        // Advance to next hour and send a record to trigger the rollover
         clockInstant.set(Instant.parse("2026-04-16T15:00:00Z"));
+        ingestionQueue.put(new TenantBatch("tenant1", List.of("{\"x\":1}")));
 
         // Wait for the new hour's .tmp to appear
         await().atMost(5, SECONDS).until(() -> {
@@ -188,7 +195,7 @@ class JsonlWriterServiceTest {
         service = createService(200, 65536);
         service.start();
 
-        ingestionQueue.put(List.of("{\"a\":1}"));
+        ingestionQueue.put(new TenantBatch("tenant1", List.of("{\"a\":1}")));
 
         await().atMost(5, SECONDS).until(() -> {
             try {
@@ -203,7 +210,7 @@ class JsonlWriterServiceTest {
         service = createService(60_000, 1);
         service.start();
 
-        ingestionQueue.put(List.of("{\"x\":1}"));
+        ingestionQueue.put(new TenantBatch("tenant1", List.of("{\"x\":1}")));
 
         await().atMost(5, SECONDS).until(() -> {
             try {

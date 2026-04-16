@@ -64,31 +64,45 @@ public class GcsUploadService {
                                 .createScoped("https://www.googleapis.com/auth/cloud-platform"));
             }
         }
-        // blank credentialsPath → Application Default Credentials
         storage = builder.build().getService();
 
-        // Register watcher before scanning so no .parquet created between the two is missed
         watchService = FileSystems.getDefault().newWatchService();
+
+        // Watch root for new tenant directory creation
         outputDirectory.register(watchService, StandardWatchEventKinds.ENTRY_CREATE);
 
-        // Queue any .parquet files that exist from previous runs and were not yet uploaded
-        try (Stream<Path> stream = Files.list(outputDirectory)) {
-            stream.filter(p -> p.getFileName().toString().endsWith(".parquet"))
-                    .filter(Files::isRegularFile)
-                    .forEach(p -> {
-                        try {
-                            queue.put(p);
-                            log.info("Queued existing .parquet for upload: {}", p.getFileName());
-                        } catch (InterruptedException e) {
-                            Thread.currentThread().interrupt();
-                        }
-                    });
+        // Register watchers and scan all existing tenant directories
+        try (Stream<Path> subdirs = Files.list(outputDirectory)) {
+            subdirs.filter(Files::isDirectory).forEach(tenantDir -> {
+                try {
+                    registerAndScanTenantDir(tenantDir);
+                } catch (IOException e) {
+                    log.warn("Could not register watcher for tenant dir: {}", tenantDir.getFileName(), e);
+                }
+            });
         }
 
         watcherThread = Thread.ofVirtual().name("parquet-watcher").start(this::watchLoop);
         uploaderThread = Thread.ofVirtual().name("gcs-uploader").start(this::uploadLoop);
         log.info("GCS uploader started — target: gs://{}/{}", bucketName,
                 objectPrefix.isBlank() ? "" : objectPrefix + "/");
+    }
+
+    private void registerAndScanTenantDir(Path tenantDir) throws IOException {
+        tenantDir.register(watchService, StandardWatchEventKinds.ENTRY_CREATE);
+
+        try (Stream<Path> stream = Files.list(tenantDir)) {
+            stream.filter(p -> p.getFileName().toString().endsWith(".parquet"))
+                    .filter(Files::isRegularFile)
+                    .forEach(p -> {
+                        try {
+                            queue.put(p);
+                            log.info("Queued existing .parquet for upload: {}", p);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                        }
+                    });
+        }
     }
 
     private void watchLoop() {
@@ -98,15 +112,27 @@ public class GcsUploadService {
                 try {
                     key = watchService.take();
                 } catch (ClosedWatchServiceException e) {
-                    break;  // stop() closed the service
+                    break;
                 }
+                Path watchedDir = (Path) key.watchable();
+
                 for (WatchEvent<?> event : key.pollEvents()) {
                     if (event.kind() == StandardWatchEventKinds.OVERFLOW) continue;
-                    Path filename = (Path) event.context();
-                    if (!filename.toString().endsWith(".parquet")) continue;
-                    Path fullPath = outputDirectory.resolve(filename);
-                    if (Files.exists(fullPath)) {
-                        queue.put(fullPath);
+                    Path name = (Path) event.context();
+                    Path fullPath = watchedDir.resolve(name);
+
+                    if (watchedDir.equals(outputDirectory)) {
+                        if (Files.isDirectory(fullPath)) {
+                            try {
+                                registerAndScanTenantDir(fullPath);
+                            } catch (IOException e) {
+                                log.warn("Could not register new tenant dir: {}", fullPath.getFileName(), e);
+                            }
+                        }
+                    } else {
+                        if (name.toString().endsWith(".parquet") && Files.exists(fullPath)) {
+                            queue.put(fullPath);
+                        }
                     }
                 }
                 key.reset();
@@ -130,12 +156,13 @@ public class GcsUploadService {
 
     private void upload(Path parquetFile) {
         if (!Files.exists(parquetFile)) {
-            return;  // already uploaded and deleted by a duplicate queue entry
+            return;
         }
 
-        String objectName = objectPrefix.isBlank()
-                ? parquetFile.getFileName().toString()
-                : objectPrefix + "/" + parquetFile.getFileName().toString();
+        String tenantId = parquetFile.getParent().getFileName().toString();
+        String filename = parquetFile.getFileName().toString();
+        String objectName = (objectPrefix.isBlank() ? "" : objectPrefix + "/")
+                + "tenant_id=" + tenantId + "/" + filename;
 
         BlobId blobId = BlobId.of(bucketName, objectName);
         BlobInfo blobInfo = BlobInfo.newBuilder(blobId)

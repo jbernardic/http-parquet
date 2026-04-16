@@ -19,7 +19,8 @@ import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
-import java.util.List;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
 @Service
@@ -50,50 +51,64 @@ public class JsonlWriterService {
         this.maxBytes = maxBytes;
     }
 
+    private static class WriterState {
+        Instant currentHour;
+        Path currentTmpPath;
+        BufferedWriter currentWriter;
+        long lastFlushMs;
+        long unflushedBytes;
+
+        WriterState(Instant hour, Path tmpPath, BufferedWriter writer, long nowMs) {
+            this.currentHour = hour;
+            this.currentTmpPath = tmpPath;
+            this.currentWriter = writer;
+            this.lastFlushMs = nowMs;
+            this.unflushedBytes = 0;
+        }
+    }
+
     @PostConstruct
     public void start() {
         writerThread = Thread.ofVirtual().name("jsonl-writer").start(this::runLoop);
     }
 
     private void runLoop() {
-        Instant currentHour = null;
-        Path currentTmpPath = null;
-        BufferedWriter currentWriter = null;
-        long lastFlushMs = System.currentTimeMillis();
-        long unflushedBytes = 0;
+        Map<String, WriterState> states = new HashMap<>();
 
         try {
             while (!Thread.currentThread().isInterrupted()) {
-                List<String> batch = ingestionQueue.poll(100, TimeUnit.MILLISECONDS);
+                TenantBatch batch = ingestionQueue.poll(100, TimeUnit.MILLISECONDS);
 
                 Instant now = clock.instant();
                 Instant hour = now.truncatedTo(ChronoUnit.HOURS);
-                if (!hour.equals(currentHour)) {
-                    BufferedWriter prev = currentWriter;
-                    Path prevTmpPath = currentTmpPath;
-                    currentWriter = null;
-                    currentTmpPath = null;
-                    closeAndFinalize(prev, prevTmpPath);
-                    currentTmpPath = tmpPathFor(now);
-                    currentWriter = openWriter(currentTmpPath);
-                    currentHour = hour;
-                    lastFlushMs = System.currentTimeMillis();
-                    unflushedBytes = 0;
-                }
+                long nowMs = System.currentTimeMillis();
 
                 if (batch != null) {
-                    for (String record : batch) {
-                        currentWriter.write(record);
-                        currentWriter.newLine();
-                        unflushedBytes += record.getBytes(StandardCharsets.UTF_8).length + 1;
+                    WriterState state = states.get(batch.tenantId());
+
+                    if (state == null || !hour.equals(state.currentHour)) {
+                        if (state != null) {
+                            closeAndFinalize(state.currentWriter, state.currentTmpPath);
+                        }
+                        Path tmpPath = tmpPathFor(batch.tenantId(), now);
+                        state = new WriterState(hour, tmpPath, openWriter(tmpPath), nowMs);
+                        states.put(batch.tenantId(), state);
+                    }
+
+                    for (String record : batch.records()) {
+                        state.currentWriter.write(record);
+                        state.currentWriter.newLine();
+                        state.unflushedBytes += record.getBytes(StandardCharsets.UTF_8).length + 1;
                     }
                 }
 
-                long nowMs = System.currentTimeMillis();
-                if (unflushedBytes >= maxBytes || (unflushedBytes > 0 && nowMs - lastFlushMs >= maxIntervalMs)) {
-                    currentWriter.flush();
-                    lastFlushMs = nowMs;
-                    unflushedBytes = 0;
+                for (WriterState state : states.values()) {
+                    if (state.unflushedBytes >= maxBytes ||
+                            (state.unflushedBytes > 0 && nowMs - state.lastFlushMs >= maxIntervalMs)) {
+                        state.currentWriter.flush();
+                        state.lastFlushMs = nowMs;
+                        state.unflushedBytes = 0;
+                    }
                 }
             }
         } catch (InterruptedException e) {
@@ -101,7 +116,9 @@ public class JsonlWriterService {
         } catch (IOException e) {
             log.error("JSONL writer error, data may be lost", e);
         } finally {
-            closeAndFinalize(currentWriter, currentTmpPath);
+            for (WriterState state : states.values()) {
+                closeAndFinalize(state.currentWriter, state.currentTmpPath);
+            }
         }
     }
 
@@ -153,13 +170,15 @@ public class JsonlWriterService {
         }
     }
 
-    private Path tmpPathFor(Instant instant) {
-        return outputDirectory.resolve(FILE_FORMATTER.format(instant) + ".jsonl.tmp");
+    private Path tmpPathFor(String tenantId, Instant instant) throws IOException {
+        Path tenantDir = outputDirectory.resolve(tenantId);
+        Files.createDirectories(tenantDir);
+        return tenantDir.resolve(FILE_FORMATTER.format(instant) + ".jsonl.tmp");
     }
 
     private Path toJsonlPath(Path tmpPath) {
         String name = tmpPath.getFileName().toString().replace(".jsonl.tmp", ".jsonl");
-        return tmpPath.getParent().resolve(name);
+        return tmpPath.resolveSibling(name);
     }
 
     @PreDestroy

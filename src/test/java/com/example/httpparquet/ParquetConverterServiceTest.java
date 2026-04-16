@@ -34,12 +34,13 @@ class ParquetConverterServiceTest {
 
     @Test
     void convertsJsonlToParquet() throws Exception {
-        Path jsonl = tempDir.resolve("2026-04-16T14.jsonl");
+        Path tenantDir = Files.createDirectories(tempDir.resolve("tenant1"));
+        Path jsonl = tenantDir.resolve("2026-04-16T14.jsonl");
         Files.writeString(jsonl, "{\"event\":\"click\",\"value\":42}\n{\"event\":\"view\",\"value\":1}\n");
 
         createAndStart();  // startup scan picks up the pre-existing .jsonl
 
-        Path parquet = tempDir.resolve("2026-04-16T14.parquet");
+        Path parquet = tenantDir.resolve("2026-04-16T14.parquet");
         await().atMost(10, SECONDS).until(() -> Files.exists(parquet));
         assertThat(Files.size(parquet)).isGreaterThan(0);
 
@@ -59,19 +60,21 @@ class ParquetConverterServiceTest {
 
     @Test
     void picksUpNewJsonlViaWatcher() throws Exception {
-        createAndStart();  // no files yet — exercises the watcher path, not the startup scan
+        // Create tenant dir before start so startup registers a watcher on it — no race condition
+        Path tenantDir = Files.createDirectories(tempDir.resolve("tenant1"));
+        createAndStart();
 
         // Drop a .jsonl after the service is already running.
         // Write to a .tmp first, then rename — this matches what JsonlWriterService does in
         // production and guarantees the ENTRY_CREATE event fires only after the file is fully
         // written (on Windows, ReadDirectoryChangesW can fire ENTRY_CREATE before content is
         // flushed if the file is created and written in a single open/write/close sequence).
-        Path tmp = tempDir.resolve("2026-04-16T15.jsonl.tmp");
+        Path tmp = tenantDir.resolve("2026-04-16T15.jsonl.tmp");
         Files.writeString(tmp, "{\"via\":\"watcher\"}\n");
-        Path jsonl = tempDir.resolve("2026-04-16T15.jsonl");
+        Path jsonl = tenantDir.resolve("2026-04-16T15.jsonl");
         Files.move(tmp, jsonl);
 
-        Path parquet = tempDir.resolve("2026-04-16T15.parquet");
+        Path parquet = tenantDir.resolve("2026-04-16T15.parquet");
         await().atMost(10, SECONDS).until(() -> Files.exists(parquet));
         assertThat(Files.size(parquet)).isGreaterThan(0);
         assertThat(Files.exists(jsonl)).isFalse();
@@ -79,10 +82,11 @@ class ParquetConverterServiceTest {
 
     @Test
     void skipsAlreadyConvertedFile() throws Exception {
-        Path jsonl = tempDir.resolve("2026-04-16T14.jsonl");
+        Path tenantDir = Files.createDirectories(tempDir.resolve("tenant1"));
+        Path jsonl = tenantDir.resolve("2026-04-16T14.jsonl");
         Files.writeString(jsonl, "{\"a\":1}\n");
 
-        Path parquet = tempDir.resolve("2026-04-16T14.parquet");
+        Path parquet = tenantDir.resolve("2026-04-16T14.parquet");
         Files.writeString(parquet, "existing");  // pre-existing parquet (fake)
 
         createAndStart();
@@ -94,12 +98,13 @@ class ParquetConverterServiceTest {
 
     @Test
     void recoversOrphanedFilesOnStartup() throws Exception {
-        Path jsonl = tempDir.resolve("2026-04-16T13.jsonl");
+        Path tenantDir = Files.createDirectories(tempDir.resolve("tenant1"));
+        Path jsonl = tenantDir.resolve("2026-04-16T13.jsonl");
         Files.writeString(jsonl, "{\"orphaned\":true}\n");
 
         createAndStart();
 
-        Path parquet = tempDir.resolve("2026-04-16T13.parquet");
+        Path parquet = tenantDir.resolve("2026-04-16T13.parquet");
         await().atMost(10, SECONDS).until(() -> Files.exists(parquet));
         assertThat(Files.size(parquet)).isGreaterThan(0);
         assertThat(Files.exists(jsonl)).isFalse();
@@ -107,18 +112,20 @@ class ParquetConverterServiceTest {
 
     @Test
     void ignoresTmpFilesOnRecovery() throws Exception {
-        Path tmp = tempDir.resolve("2026-04-16T14.jsonl.tmp");
+        Path tenantDir = Files.createDirectories(tempDir.resolve("tenant1"));
+        Path tmp = tenantDir.resolve("2026-04-16T14.jsonl.tmp");
         Files.writeString(tmp, "{\"in-progress\":true}\n");
 
         createAndStart();
         Thread.sleep(500);
 
-        assertThat(Files.exists(tempDir.resolve("2026-04-16T14.parquet"))).isFalse();
+        assertThat(Files.exists(tenantDir.resolve("2026-04-16T14.parquet"))).isFalse();
     }
 
     @Test
     void deletesOrphanedParquetTmpOnStartup() throws Exception {
-        Path parquetTmp = tempDir.resolve("2026-04-16T14.parquet.tmp");
+        Path tenantDir = Files.createDirectories(tempDir.resolve("tenant1"));
+        Path parquetTmp = tenantDir.resolve("2026-04-16T14.parquet.tmp");
         Files.writeString(parquetTmp, "incomplete");
 
         createAndStart();

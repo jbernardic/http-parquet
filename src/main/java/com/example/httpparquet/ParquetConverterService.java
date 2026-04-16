@@ -35,26 +35,42 @@ public class ParquetConverterService {
 
     @PostConstruct
     public void start() throws IOException {
-        // Register watcher before scanning so no .jsonl created between the two is missed
         watchService = FileSystems.getDefault().newWatchService();
+
+        // Watch root for new tenant directory creation
         outputDirectory.register(watchService, StandardWatchEventKinds.ENTRY_CREATE);
 
-        // Remove any .parquet.tmp files left by a crash mid-conversion — they are incomplete
-        // and cannot be resumed; the source .jsonl will trigger re-conversion below
-        try (Stream<Path> stream = Files.list(outputDirectory)) {
+        // Register watchers and scan all existing tenant directories
+        try (Stream<Path> subdirs = Files.list(outputDirectory)) {
+            subdirs.filter(Files::isDirectory).forEach(tenantDir -> {
+                try {
+                    registerAndScanTenantDir(tenantDir);
+                } catch (IOException e) {
+                    log.warn("Could not register watcher for tenant dir: {}", tenantDir.getFileName(), e);
+                }
+            });
+        }
+
+        watcherThread = Thread.ofVirtual().name("jsonl-watcher").start(this::watchLoop);
+        converterThread = Thread.ofVirtual().name("parquet-converter").start(this::convertLoop);
+    }
+
+    private void registerAndScanTenantDir(Path tenantDir) throws IOException {
+        tenantDir.register(watchService, StandardWatchEventKinds.ENTRY_CREATE);
+
+        try (Stream<Path> stream = Files.list(tenantDir)) {
             stream.filter(p -> p.getFileName().toString().endsWith(".parquet.tmp"))
                     .forEach(p -> {
                         try {
                             Files.deleteIfExists(p);
-                            log.warn("Deleted orphaned .parquet.tmp: {}", p.getFileName());
+                            log.warn("Deleted orphaned .parquet.tmp: {}", p);
                         } catch (IOException e) {
-                            log.warn("Could not delete orphaned .parquet.tmp: {}", p.getFileName(), e);
+                            log.warn("Could not delete orphaned .parquet.tmp: {}", p, e);
                         }
                     });
         }
 
-        // Queue any .jsonl files that have no matching .parquet yet
-        try (Stream<Path> stream = Files.list(outputDirectory)) {
+        try (Stream<Path> stream = Files.list(tenantDir)) {
             stream.filter(p -> p.getFileName().toString().endsWith(".jsonl"))
                     .filter(p -> !Files.exists(toParquetPath(p)))
                     .filter(this::isNonEmpty)
@@ -62,15 +78,12 @@ public class ParquetConverterService {
                     .forEach(p -> {
                         try {
                             queue.put(p);
-                            log.info("Queued existing .jsonl for conversion: {}", p.getFileName());
+                            log.info("Queued existing .jsonl for conversion: {}", p);
                         } catch (InterruptedException e) {
                             Thread.currentThread().interrupt();
                         }
                     });
         }
-
-        watcherThread = Thread.ofVirtual().name("jsonl-watcher").start(this::watchLoop);
-        converterThread = Thread.ofVirtual().name("parquet-converter").start(this::convertLoop);
     }
 
     private void watchLoop() {
@@ -80,15 +93,27 @@ public class ParquetConverterService {
                 try {
                     key = watchService.take();
                 } catch (ClosedWatchServiceException e) {
-                    break;  // stop() closed the service
+                    break;
                 }
+                Path watchedDir = (Path) key.watchable();
+
                 for (WatchEvent<?> event : key.pollEvents()) {
                     if (event.kind() == StandardWatchEventKinds.OVERFLOW) continue;
-                    Path filename = (Path) event.context();
-                    if (!filename.toString().endsWith(".jsonl")) continue;
-                    Path fullPath = outputDirectory.resolve(filename);
-                    if (isNonEmpty(fullPath)) {
-                        queue.put(fullPath);
+                    Path name = (Path) event.context();
+                    Path fullPath = watchedDir.resolve(name);
+
+                    if (watchedDir.equals(outputDirectory)) {
+                        if (Files.isDirectory(fullPath)) {
+                            try {
+                                registerAndScanTenantDir(fullPath);
+                            } catch (IOException e) {
+                                log.warn("Could not register new tenant dir: {}", fullPath.getFileName(), e);
+                            }
+                        }
+                    } else {
+                        if (name.toString().endsWith(".jsonl") && isNonEmpty(fullPath)) {
+                            queue.put(fullPath);
+                        }
                     }
                 }
                 key.reset();
@@ -113,12 +138,10 @@ public class ParquetConverterService {
     private void convert(Path jsonlFile) {
         Path parquetFile = toParquetPath(jsonlFile);
         if (Files.exists(parquetFile)) {
-            log.info("Parquet already exists, skipping: {}", parquetFile.getFileName());
+            log.info("Parquet already exists, skipping: {}", parquetFile);
             return;
         }
 
-        // DuckDB writes to .parquet.tmp first. The GCS watcher only watches for .parquet
-        // (created by the atomic rename below), so it is guaranteed to see a complete file.
         Path parquetTmpFile = parquetFile.resolveSibling(parquetFile.getFileName() + ".tmp");
         String jsonlPath = jsonlFile.toAbsolutePath().toString().replace('\\', '/');
         String parquetTmpPath = parquetTmpFile.toAbsolutePath().toString().replace('\\', '/');
@@ -130,8 +153,7 @@ public class ParquetConverterService {
              Statement stmt = conn.createStatement()) {
             stmt.execute(sql);
         } catch (SQLException e) {
-            log.error("DuckDB conversion failed for {}, will retry on next startup",
-                    jsonlFile.getFileName(), e);
+            log.error("DuckDB conversion failed for {}, will retry on next startup", jsonlFile, e);
             try { Files.deleteIfExists(parquetTmpFile); } catch (IOException ignored) {}
             return;
         }
@@ -148,13 +170,13 @@ public class ParquetConverterService {
         try {
             Files.deleteIfExists(jsonlFile);
         } catch (IOException e) {
-            log.warn("Conversion succeeded but failed to delete {}", jsonlFile.getFileName(), e);
+            log.warn("Conversion succeeded but failed to delete {}", jsonlFile);
         }
     }
 
     private Path toParquetPath(Path jsonlFile) {
         String name = jsonlFile.getFileName().toString().replace(".jsonl", ".parquet");
-        return outputDirectory.resolve(name);
+        return jsonlFile.resolveSibling(name);
     }
 
     private boolean isNonEmpty(Path file) {

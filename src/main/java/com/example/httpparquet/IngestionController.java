@@ -7,6 +7,7 @@ import tools.jackson.databind.node.ArrayNode;
 import tools.jackson.databind.node.ObjectNode;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
+import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.ResponseStatus;
@@ -27,9 +28,9 @@ public class IngestionController {
         this.objectMapper = objectMapper;
     }
 
-    @PostMapping(value = "/ingest", consumes = MediaType.APPLICATION_JSON_VALUE)
+    @PostMapping(value = "/ingest/{tenantId}", consumes = MediaType.APPLICATION_JSON_VALUE)
     @ResponseStatus(HttpStatus.ACCEPTED)
-    public void ingest(@RequestBody String body) {
+    public void ingest(@PathVariable String tenantId, @RequestBody String body) {
         JsonNode tree;
         try {
             tree = objectMapper.readTree(body);
@@ -55,7 +56,7 @@ public class IngestionController {
         }
 
         try {
-            ingestionQueue.put(batch);
+            ingestionQueue.put(new TenantBatch(tenantId, batch));
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE, "Server shutting down");
