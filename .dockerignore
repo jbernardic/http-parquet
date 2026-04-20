@@ -1,0 +1,10 @@
+target/
+.git/
+.idea/
+.vscode/
+*.iml
+data/
+.ipynb_checkpoints/
+*.py
+HELP.md
+DETAILS.md
