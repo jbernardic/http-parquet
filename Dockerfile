@@ -11,12 +11,9 @@ RUN ./mvnw package -DskipTests -q
 FROM eclipse-temurin:21-jre
 WORKDIR /app
 
-RUN addgroup --system app && adduser --system --ingroup app app
-
 COPY --from=build /build/target/*.jar app.jar
 
-RUN mkdir -p /data && chown app:app /data
-USER app
+RUN mkdir -p /data
 
 ENV SPRING_PROFILES_ACTIVE=default
 ENV ingestion.output-dir=/data
