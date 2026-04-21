@@ -146,7 +146,7 @@ public class ParquetConverterService {
         String jsonlPath = jsonlFile.toAbsolutePath().toString().replace('\\', '/');
         String parquetTmpPath = parquetTmpFile.toAbsolutePath().toString().replace('\\', '/');
         String sql = String.format(
-                "COPY (SELECT * FROM read_ndjson_auto('%s')) TO '%s' (FORMAT PARQUET)",
+                "COPY (SELECT * FROM read_ndjson_auto('%s', union_by_name=true)) TO '%s' (FORMAT PARQUET)",
                 jsonlPath.replace("'", "''"), parquetTmpPath.replace("'", "''"));
 
         try (Connection conn = DriverManager.getConnection("jdbc:duckdb:");
